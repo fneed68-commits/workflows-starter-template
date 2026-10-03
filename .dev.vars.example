@@ -1,0 +1,10 @@
+# Copy to .dev.vars for local development.
+# Production secrets are set with `wrangler secret put <NAME>`.
+
+# REQUIRED: bearer token for /api/* and /ws auth.
+# Generate a random one with: openssl rand -hex 32
+API_TOKEN=CHANGEME_generate_with_openssl_rand_hex_32
+
+# OPTIONAL: comma-separated list of allowed CORS origins.
+# If empty, no CORS headers are sent (same-origin only).
+ALLOWED_ORIGINS=http://localhost:5173,https://your-domain.example

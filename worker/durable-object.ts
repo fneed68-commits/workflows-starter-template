@@ -1,145 +1,179 @@
 import { DurableObject } from "cloudflare:workers";
 
 /**
- * WorkflowStatusDO - Durable Object for managing workflow state and WebSocket connections
+ * WorkflowStatusDO — Durable Object for workflow state and WebSocket fanout.
  *
  * Responsibilities:
- * - Accept and manage WebSocket connections using hibernation API
- * - Track step statuses for a workflow instance
- * - Broadcast updates to all connected clients
- * - Provide RPC method for workflow to update step status
+ *  - Accept WebSocket connections using the hibernation API
+ *  - Track step statuses for one workflow instance
+ *  - Broadcast updates to all connected clients
+ *  - Expose an RPC `updateStep` called by the workflow
  */
+
+export type StepStatus = "pending" | "running" | "waiting" | "completed" | "error";
+export type WorkflowStatus = "running" | "completed" | "error";
+
+// Canonical step order — kept in sync with MyWorkflow.run().
+const STEP_NAMES = [
+    "process data",
+    "wait 2 seconds",
+    "wait for approval",
+    "final",
+] as const;
+
+interface StateSnapshot {
+    stepStatuses: Record<string, StepStatus>;
+    currentStep: string | null;
+    workflowStatus: WorkflowStatus;
+}
+
 export class WorkflowStatusDO extends DurableObject {
-	private stepStatuses: Map<string, string>;
-	private currentStep: string | null;
-	private workflowStatus: "running" | "completed" | "error";
+    private stepStatuses: Map<string, StepStatus>;
+    private currentStep: string | null;
+    private workflowStatus: WorkflowStatus;
 
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
+    constructor(ctx: DurableObjectState, env: Env) {
+        super(ctx, env);
 
-		this.stepStatuses = new Map();
-		this.currentStep = null;
-		this.workflowStatus = "running";
+        this.stepStatuses = new Map();
+        this.currentStep = null;
+        this.workflowStatus = "running";
 
-		// Load state from durable storage to survive hibernation/eviction
-		ctx.blockConcurrencyWhile(async () => {
-			const storedStatuses =
-				await ctx.storage.get<Record<string, string>>("stepStatuses");
-			const storedCurrent = await ctx.storage.get<string | null>("currentStep");
-			const storedWorkflowStatus = await ctx.storage.get<
-				"running" | "completed" | "error"
-			>("workflowStatus");
+        // Restore state from storage (survives hibernation / eviction).
+        ctx.blockConcurrencyWhile(async () => {
+            const snapshot = await ctx.storage.get<StateSnapshot>("state");
+            if (snapshot) {
+                this.stepStatuses = new Map(
+                    Object.entries(snapshot.stepStatuses ?? {}) as [string, StepStatus][],
+                );
+                this.currentStep = snapshot.currentStep ?? null;
+                this.workflowStatus = snapshot.workflowStatus ?? "running";
+            } else {
+                for (const name of STEP_NAMES) {
+                    this.stepStatuses.set(name, "pending");
+                }
+            }
+        });
+    }
 
-			if (storedStatuses) {
-				this.stepStatuses = new Map(Object.entries(storedStatuses));
-			} else {
-				const steps = [
-					"process data",
-					"wait 2 seconds",
-					"wait for approval",
-					"final",
-				];
-				steps.forEach((s) => this.stepStatuses.set(s, "pending"));
-			}
+    // ─── HTTP / WebSocket ─────────────────────────────────────────
 
-			this.currentStep = storedCurrent ?? null;
-			this.workflowStatus = storedWorkflowStatus ?? "running";
-		});
-	}
+    async fetch(request: Request): Promise<Response> {
+        const upgrade = request.headers.get("Upgrade");
+        if (upgrade?.toLowerCase() !== "websocket") {
+            return new Response("Expected WebSocket", { status: 400 });
+        }
 
-	async fetch(request: Request): Promise<Response> {
-		if (request.headers.get("Upgrade") === "websocket") {
-			const pair = new WebSocketPair();
-			const [client, server] = Object.values(pair);
+        const pair = new WebSocketPair();
+        const [client, server] = Object.values(pair);
 
-			// Use hibernation API - acceptWebSocket allows the DO to hibernate
-			this.ctx.acceptWebSocket(server);
+        // Hibernation API: DO can hibernate while sockets stay open.
+        this.ctx.acceptWebSocket(server);
 
-			// Send current state immediately upon connection
-			server.send(JSON.stringify(this.getStateMessage()));
+        // Send the current state immediately.
+        try {
+            server.send(JSON.stringify(this.getStateMessage()));
+        } catch {
+            // A brand-new socket should be writable; if not, drop it.
+            server.close(1011, "init-send-failed");
+        }
 
-			return new Response(null, { status: 101, webSocket: client });
-		}
+        return new Response(null, { status: 101, webSocket: client });
+    }
 
-		return new Response("Expected WebSocket", { status: 400 });
-	}
+    // ─── RPC (called by the workflow) ─────────────────────────────
 
-	/**
-	 * RPC method called by the workflow to update step status
-	 * This is called via stub.updateStep() from the workflow
-	 */
-	async updateStep(stepName: string, status: string): Promise<void> {
-		this.stepStatuses.set(stepName, status);
+    async updateStep(stepName: string, status: StepStatus): Promise<void> {
+        if (!STEP_NAMES.includes(stepName as (typeof STEP_NAMES)[number])) {
+            console.warn("workflow.unknown_step", { stepName });
+            return;
+        }
 
-		if (status === "running" || status === "waiting") {
-			this.currentStep = stepName;
-		}
+        this.stepStatuses.set(stepName, status);
 
-		const allCompleted = Array.from(this.stepStatuses.values()).every(
-			(s) => s === "completed",
-		);
-		if (allCompleted) {
-			this.workflowStatus = "completed";
-			this.currentStep = null;
-		}
+        if (status === "running" || status === "waiting") {
+            this.currentStep = stepName;
+        } else if (status === "completed" && this.currentStep === stepName) {
+            this.currentStep = null;
+        }
 
-		await this.ctx.storage.put(
-			"stepStatuses",
-			Object.fromEntries(this.stepStatuses),
-		);
-		await this.ctx.storage.put("currentStep", this.currentStep);
-		await this.ctx.storage.put("workflowStatus", this.workflowStatus);
+        const allCompleted = [...this.stepStatuses.values()].every(
+            (s) => s === "completed",
+        );
+        const anyErrored = [...this.stepStatuses.values()].some(
+            (s) => s === "error",
+        );
 
-		this.broadcast(this.getStateMessage());
-	}
+        if (anyErrored) {
+            this.workflowStatus = "error";
+            this.currentStep = null;
+        } else if (allCompleted) {
+            this.workflowStatus = "completed";
+            this.currentStep = null;
+        }
 
-	/**
-	 * WebSocket message handler (hibernation API)
-	 * Called when a client sends a message
-	 */
-	async webSocketMessage(ws: WebSocket, _message: string): Promise<void> {
-		ws.send(JSON.stringify(this.getStateMessage()));
-	}
+        // LESSON (nodejs-pool): atomic write. One put = one transaction.
+        await this.ctx.storage.put<StateSnapshot>("state", {
+            stepStatuses: Object.fromEntries(this.stepStatuses) as Record<string, StepStatus>,
+            currentStep: this.currentStep,
+            workflowStatus: this.workflowStatus,
+        });
 
-	/**
-	 * WebSocket close handler (hibernation API)
-	 * Called when a client closes the connection
-	 */
-	async webSocketClose(
-		ws: WebSocket,
-		code: number,
-		reason: string,
-		_wasClean: boolean,
-	): Promise<void> {
-		ws.close(code, reason);
-	}
+        this.broadcast(this.getStateMessage());
+    }
 
-	/**
-	 * Broadcast a message to all connected WebSocket clients
-	 */
-	private broadcast(message: object): void {
-		const sockets = this.ctx.getWebSockets();
-		const json = JSON.stringify(message);
+    // ─── WebSocket event handlers (hibernation API) ───────────────
 
-		for (const socket of sockets) {
-			try {
-				socket.send(json);
-			} catch {
-				// Ignore errors for disconnected sockets
-			}
-		}
-	}
+    async webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
+        // Echo current state on any client message (heartbeat-friendly).
+        try {
+            ws.send(JSON.stringify(this.getStateMessage()));
+        } catch {
+            // Client may have disconnected between checks.
+        }
+    }
 
-	/**
-	 * Get the current state as a message object
-	 */
-	private getStateMessage(): object {
-		return {
-			type: "workflow_update",
-			currentStep: this.currentStep,
-			stepStatuses: Object.fromEntries(this.stepStatuses),
-			workflowStatus: this.workflowStatus,
-			timestamp: Date.now(),
-		};
-	}
+    async webSocketClose(
+        _ws: WebSocket,
+        _code: number,
+        _reason: string,
+        _wasClean: boolean,
+    ): Promise<void> {
+        // Cloudflare closes the socket automatically after this handler.
+        // Calling ws.close() here would be redundant (and may warn).
+    }
+
+    async webSocketError(_ws: WebSocket, error: unknown): Promise<void> {
+        // LESSON (all previous audits): never swallow errors silently.
+        console.error("workflow.ws_error", {
+            error: error instanceof Error ? error.message : String(error),
+        });
+        // The runtime closes the faulty socket after this handler returns.
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────
+
+    private broadcast(message: object): void {
+        const json = JSON.stringify(message);
+        for (const socket of this.ctx.getWebSockets()) {
+            try {
+                socket.send(json);
+            } catch (err) {
+                // A client that vanished mid-send: log once, keep going.
+                console.warn("workflow.ws_broadcast_failed", {
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            }
+        }
+    }
+
+    private getStateMessage(): object {
+        return {
+            type: "workflow_update",
+            currentStep: this.currentStep,
+            stepStatuses: Object.fromEntries(this.stepStatuses),
+            workflowStatus: this.workflowStatus,
+            timestamp: Date.now(),
+        };
+    }
 }
