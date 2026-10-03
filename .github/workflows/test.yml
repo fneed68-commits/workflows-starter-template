@@ -41,8 +41,11 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      # Build the frontend so `assets.directory` (./dist) exists before
+      # Vitest starts — wrangler reads that field at config time and
+      # refuses to run when the directory is missing.
+      - name: Build frontend
+        run: npm run build
+
       - name: Test
         run: npm test
-
-      - name: Build
-        run: npm run build
