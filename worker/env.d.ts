@@ -1,6 +1,5 @@
 /// <reference types="@cloudflare/vitest-pool-workers" />
 
-import type { MyWorkflow } from "./workflow";
 import type { WorkflowStatusDO } from "./durable-object";
 
 declare global {
@@ -10,7 +9,6 @@ declare global {
         API_TOKEN: string;
 
         // Optional: comma-separated list of allowed CORS origins.
-        // If unset, no CORS headers are emitted (same-origin only).
         ALLOWED_ORIGINS?: string;
 
         // Bindings declared in wrangler.jsonc
@@ -19,5 +17,4 @@ declare global {
     }
 }
 
-// Make this a module so `declare global` is valid.
 export {};

@@ -135,12 +135,15 @@ export class WorkflowStatusDO extends DurableObject {
 
     async webSocketClose(
         _ws: WebSocket,
-        _code: number,
-        _reason: string,
+        code: number,
+        reason: string,
         _wasClean: boolean,
     ): Promise<void> {
         // Cloudflare closes the socket automatically after this handler.
-        // Calling ws.close() here would be redundant (and may warn).
+        // Log abnormal closures so operators can investigate.
+        if (code !== 1000 && code !== 1001) {
+            console.warn("workflow.ws_close_abnormal", { code, reason });
+        }
     }
 
     async webSocketError(_ws: WebSocket, error: unknown): Promise<void> {
