@@ -134,8 +134,11 @@ describe("fetch: routing", () => {
     });
 
     it("returns 400 for an instanceId with bad characters", async () => {
+        // Note: the URL parser normalizes ".." segments before our code
+        // sees them, so we use characters that survive parsing but fail
+        // our instanceId regex (^[A-Za-z0-9_\-.:]+$).
         const res = await callWorker(
-            "/api/workflow/status/abc%20def/../x",
+            "/api/workflow/status/bad!id",
             { method: "GET", headers: authedHeaders() },
         );
         expect(res.status).toBe(400);
