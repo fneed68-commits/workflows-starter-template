@@ -6,24 +6,26 @@ import tseslint from "typescript-eslint";
 import { globalIgnores } from "eslint/config";
 
 export default tseslint.config([
-	globalIgnores(["dist", "worker-configuration.d.ts"]),
-	{
-		files: ["**/*.{ts,tsx}"],
-		extends: [
-			js.configs.recommended,
-			tseslint.configs.recommended,
-			reactHooks.configs.flat["recommended-latest"],
-			reactRefresh.configs.vite,
-		],
-		languageOptions: {
-			ecmaVersion: 2020,
-			globals: globals.browser,
-		},
-		rules: {
-			"@typescript-eslint/no-unused-vars": [
-				"error",
-				{ argsIgnorePattern: "^_" },
-			],
-		},
-	},
+    globalIgnores(["dist", "worker-configuration.d.ts"]),
+    {
+        files: ["**/*.{ts,tsx}"],
+        extends: [
+            js.configs.recommended,
+            tseslint.configs.recommended,
+            reactHooks.configs.flat["recommended-latest"],
+            reactRefresh.configs.vite,
+        ],
+        languageOptions: {
+            ecmaVersion: 2020,
+            globals: globals.browser,
+        },
+        rules: {
+            "@typescript-eslint/no-unused-vars": [
+                "error",
+                { argsIgnorePattern: "^_" },
+            ],
+            "no-undef": "off",
+            "no-empty": ["error", { allowEmptyCatch: true }],
+        },
+    },
 ]);

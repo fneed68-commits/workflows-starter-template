@@ -131,6 +131,12 @@ async function handleStart(
     env: Env,
     origin: string | null,
 ): Promise<Response> {
+    // Drain any body (we accept JSON but do not use it yet).
+    try {
+        await readJsonBody(request, MAX_BODY_BYTES);
+    } catch {
+        // An empty or malformed body is fine for /start.
+    }
     const instance = await env.MY_WORKFLOW.create({
         params: { timestamp: Date.now() },
     });
