@@ -3,126 +3,127 @@ export { MyWorkflow } from "./workflow";
 export { WorkflowStatusDO } from "./durable-object";
 
 /**
- * Main Worker fetch handler
+ * Main Worker fetch handler.
  *
- * Handles API routes and WebSocket upgrade requests for workflow management:
- * - POST /api/workflow/start - Create new workflow instance
- * - GET /api/workflow/status/:id - Get workflow status
- * - POST /api/workflow/event/:id - Send events to workflow
- * - GET /ws - WebSocket connection for real-time updates
+ * Routes:
+ *  - POST /api/workflow/start       Create new workflow instance
+ *  - GET  /api/workflow/status/:id  Get workflow status
+ *  - POST /api/workflow/event/:id   Send events to a running workflow
+ *  - GET  /ws?instanceId=...&token=...  WebSocket for live updates
+ *
+ * All /api routes require `Authorization: Bearer <API_TOKEN>`.
+ * WebSocket accepts `?token=<API_TOKEN>` (browsers cannot set headers).
  */
-export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
-		const url = new URL(request.url);
 
-		// API: Start a new workflow instance
-		if (url.pathname === "/api/workflow/start" && request.method === "POST") {
-			try {
-				const instance = await env.MY_WORKFLOW.create({
-					params: {
-						timestamp: Date.now(),
-					},
-				});
+// ─── Constants ────────────────────────────────────────────────────
+const MAX_BODY_BYTES = 4 * 1024;
+const MAX_INSTANCE_ID_LEN = 128;
+const BEARER_PREFIX = "Bearer ";
 
-				return Response.json({
-					instanceId: instance.id,
-					message: "Workflow started successfully",
-				});
-			} catch {
-				return Response.json(
-					{ error: "Failed to start workflow" },
-					{ status: 500 },
-				);
-			}
-		}
+// ─── Helpers ──────────────────────────────────────────────────────
 
-		// API: Get workflow status
-		if (url.pathname.startsWith("/api/workflow/status/")) {
-			const instanceId = url.pathname.split("/").pop();
-			if (!instanceId) {
-				return Response.json(
-					{ error: "Instance ID required" },
-					{ status: 400 },
-				);
-			}
+function safeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) {
+        diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return diff === 0;
+}
 
-			try {
-				const instance = await env.MY_WORKFLOW.get(instanceId);
-				const status = await instance.status();
-				return Response.json(status);
-			} catch {
-				return Response.json(
-					{ error: "Failed to get workflow status" },
-					{ status: 500 },
-				);
-			}
-		}
+function getBearerToken(request: Request): string | null {
+    const header = request.headers.get("Authorization");
+    if (!header || !header.startsWith(BEARER_PREFIX)) return null;
+    return header.slice(BEARER_PREFIX.length).trim() || null;
+}
 
-		// API: Send event to workflow instance
-		if (
-			url.pathname.startsWith("/api/workflow/event/") &&
-			request.method === "POST"
-		) {
-			const instanceId = url.pathname.split("/").pop();
-			if (!instanceId) {
-				return Response.json(
-					{ error: "Instance ID required" },
-					{ status: 400 },
-				);
-			}
+function jsonError(
+    status: number,
+    error: string,
+    detail: string | undefined,
+    origin: string | null,
+    env?: Env,
+): Response {
+    const body: Record<string, unknown> = { error };
+    if (detail) body.detail = detail;
+    const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+    };
+    if (env && origin) {
+        Object.assign(headers, corsHeaders(origin, env));
+    }
+    return new Response(JSON.stringify(body), { status, headers });
+}
 
-			try {
-				const body = (await request.json()) as {
-					approved: boolean;
-					comment?: string;
-				};
-				const instance = await env.MY_WORKFLOW.get(instanceId);
+function corsHeaders(origin: string | null, env: Env): Record<string, string> {
+    if (!origin) return {};
+    const allowed = (env.ALLOWED_ORIGINS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    if (allowed.length === 0) return {};
+    if (!allowed.includes(origin) && !allowed.includes("*")) return {};
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Max-Age": "86400",
+        Vary: "Origin",
+    };
+}
 
-				await instance.sendEvent({
-					type: "user-approval",
-					payload: body,
-				});
+function requireAuth(
+    request: Request,
+    env: Env,
+    origin: string | null,
+): Response | null {
+    const expected = env.API_TOKEN;
+    if (!expected) {
+        return jsonError(500, "Server auth not configured", undefined, origin);
+    }
+    const provided = getBearerToken(request);
+    if (!provided || !safeEqual(provided, expected)) {
+        return jsonError(401, "Unauthorized", undefined, origin);
+    }
+    return null;
+}
 
-				return Response.json({
-					success: true,
-					message: "Event sent successfully",
-				});
-			} catch {
-				return Response.json(
-					{ error: "Failed to send event" },
-					{ status: 500 },
-				);
-			}
-		}
+function isValidInstanceId(id: string): boolean {
+    if (!id || id.length > MAX_INSTANCE_ID_LEN) return false;
+    return /^[A-Za-z0-9_\-.:]+$/.test(id);
+}
 
-		// WebSocket: Connect to workflow status updates
-		if (url.pathname === "/ws") {
-			const instanceId = url.searchParams.get("instanceId");
-			if (!instanceId) {
-				return new Response("instanceId query parameter required", {
-					status: 400,
-				});
-			}
+async function readJsonBody<T = unknown>(
+    request: Request,
+    maxBytes: number,
+): Promise<T> {
+    const lengthHeader = request.headers.get("Content-Length");
+    if (lengthHeader) {
+        const len = Number(lengthHeader);
+        if (Number.isFinite(len) && len > maxBytes) {
+            throw new Error(`Request body exceeds ${maxBytes} bytes`);
+        }
+    }
+    const text = await request.text();
+    if (text.length > maxBytes) {
+        throw new Error(`Request body exceeds ${maxBytes} bytes`);
+    }
+    if (!text) return {} as T;
+    return JSON.parse(text) as T;
+}
 
-			const upgradeHeader = request.headers.get("Upgrade");
-			if (upgradeHeader !== "websocket") {
-				return new Response("Expected Upgrade: websocket", { status: 426 });
-			}
-
-			try {
-				const doId = env.WORKFLOW_STATUS.idFromName(instanceId);
-				const stub = env.WORKFLOW_STATUS.get(doId);
-				return stub.fetch(request);
-			} catch {
-				return new Response("Failed to establish WebSocket connection", {
-					status: 500,
-				});
-			}
-		}
-
-		return Response.json({ error: "Not Found" }, { status: 404 });
-	},
-} satisfies ExportedHandler<Env>;
+function isApprovalPayload(v: unknown): v is {
+    approved: boolean;
+    comment?: string;
+} {
+    if (typeof v !== "object" || v === null) return false;
+    const r = v as Record<string, unknown>;
+    if (typeof r.approved !== "boolean") return false;
+    if (r.comment !== undefined && typeof r.comment !== "string") return false;
+    if (typeof r.comment === "string" && r.comment.length > 1000) return false;
+    return true;
+}
 
 // ─── Route handlers ───────────────────────────────────────────────
 
@@ -131,11 +132,11 @@ async function handleStart(
     env: Env,
     origin: string | null,
 ): Promise<Response> {
-    // Drain any body (we accept JSON but do not use it yet).
+    // Drain any body (accepted JSON is ignored for now).
     try {
         await readJsonBody(request, MAX_BODY_BYTES);
     } catch {
-        // An empty or malformed body is fine for /start.
+        // Empty or malformed body is fine for /start.
     }
     const instance = await env.MY_WORKFLOW.create({
         params: { timestamp: Date.now() },
@@ -144,7 +145,7 @@ async function handleStart(
         instanceId: instance.id,
         message: "Workflow started successfully",
     });
-    if (env && origin) {
+    if (origin) {
         for (const [k, v] of Object.entries(corsHeaders(origin, env))) {
             res.headers.set(k, v);
         }
@@ -160,8 +161,10 @@ async function handleStatus(
     const instance = await env.MY_WORKFLOW.get(instanceId);
     const status = await instance.status();
     const res = Response.json(status);
-    for (const [k, v] of Object.entries(corsHeaders(origin, env))) {
-        res.headers.set(k, v);
+    if (origin) {
+        for (const [k, v] of Object.entries(corsHeaders(origin, env))) {
+            res.headers.set(k, v);
+        }
     }
     return res;
 }
@@ -176,12 +179,22 @@ async function handleEvent(
     try {
         body = await readJsonBody(request, MAX_BODY_BYTES);
     } catch (e) {
-        return jsonError(400, "Invalid JSON body", 
-            e instanceof Error ? e.message : undefined, origin, env);
+        return jsonError(
+            400,
+            "Invalid JSON body",
+            e instanceof Error ? e.message : undefined,
+            origin,
+            env,
+        );
     }
     if (!isApprovalPayload(body)) {
-        return jsonError(400, "Invalid payload shape",
-            "Expected { approved: boolean, comment?: string }", origin, env);
+        return jsonError(
+            400,
+            "Invalid payload shape",
+            "Expected { approved: boolean, comment?: string }",
+            origin,
+            env,
+        );
     }
     const instance = await env.MY_WORKFLOW.get(instanceId);
     await instance.sendEvent({
@@ -192,8 +205,10 @@ async function handleEvent(
         success: true,
         message: "Event sent successfully",
     });
-    for (const [k, v] of Object.entries(corsHeaders(origin, env))) {
-        res.headers.set(k, v);
+    if (origin) {
+        for (const [k, v] of Object.entries(corsHeaders(origin, env))) {
+            res.headers.set(k, v);
+        }
     }
     return res;
 }
@@ -203,8 +218,8 @@ async function handleWebSocket(
     env: Env,
     instanceId: string,
 ): Promise<Response> {
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader?.toLowerCase() !== "websocket") {
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade?.toLowerCase() !== "websocket") {
         return new Response("Expected Upgrade: websocket", { status: 426 });
     }
     const doId = env.WORKFLOW_STATUS.idFromName(instanceId);
@@ -219,7 +234,7 @@ export default {
         const url = new URL(request.url);
         const origin = request.headers.get("Origin");
 
-        // 1. CORS preflight — always respond, no auth needed
+        // 1. CORS preflight — no auth needed
         if (request.method === "OPTIONS") {
             return new Response(null, {
                 status: 204,
@@ -227,7 +242,7 @@ export default {
             });
         }
 
-        // 2. WebSocket route — auth via query param (browsers can't set headers)
+        // 2. WebSocket route — auth via query param
         if (url.pathname === "/ws") {
             const instanceId = url.searchParams.get("instanceId");
             const token = url.searchParams.get("token");
@@ -258,18 +273,20 @@ export default {
             try {
                 return await handleStart(request, env, origin);
             } catch (err) {
-                // LESSON (P1): explicit logging, no swallowed errors
                 console.error("workflow.start_failed", {
                     error: err instanceof Error ? err.message : String(err),
                 });
-                return jsonError(500, "Failed to start workflow",
+                return jsonError(
+                    500,
+                    "Failed to start workflow",
                     err instanceof Error ? err.message : undefined,
-                    origin, env);
+                    origin,
+                    env,
+                );
             }
         }
 
         // 5. GET /api/workflow/status/:id
-        // LESSON (URL parsing): strict prefix match, not pathname.split
         const statusPrefix = "/api/workflow/status/";
         if (url.pathname.startsWith(statusPrefix) && request.method === "GET") {
             const instanceId = url.pathname.slice(statusPrefix.length);
@@ -283,9 +300,13 @@ export default {
                     instanceId,
                     error: err instanceof Error ? err.message : String(err),
                 });
-                return jsonError(500, "Failed to get workflow status",
+                return jsonError(
+                    500,
+                    "Failed to get workflow status",
                     err instanceof Error ? err.message : undefined,
-                    origin, env);
+                    origin,
+                    env,
+                );
             }
         }
 
@@ -303,9 +324,13 @@ export default {
                     instanceId,
                     error: err instanceof Error ? err.message : String(err),
                 });
-                return jsonError(500, "Failed to send event",
+                return jsonError(
+                    500,
+                    "Failed to send event",
                     err instanceof Error ? err.message : undefined,
-                    origin, env);
+                    origin,
+                    env,
+                );
             }
         }
 

@@ -62,7 +62,7 @@ export class MyWorkflow extends WorkflowEntrypoint<Env, Record<string, unknown>>
 
         // ─── Step 3: wait for approval event ───────────────────────
         await notify("wait for approval", "waiting");
-        let approval: WorkflowEvent<ApprovalPayload>;
+        let approval: { payload: ApprovalPayload };
         try {
             approval = await step.waitForEvent<ApprovalPayload>(
                 "wait for approval",
